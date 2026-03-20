@@ -17,3 +17,8 @@ def backup_database(payload: dict):
         "backup_size": "2.4GB",
         "duration_seconds": 1
     }
+
+def slow_job(payload: dict):
+    print("Starting slow job, will take 60 seconds...")
+    time.sleep(60)  # simulates a long running job
+    return {"done": True}

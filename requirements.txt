@@ -6,3 +6,4 @@ redis
 pydantic
 python-dotenv
 apscheduler
+croniter

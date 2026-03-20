@@ -1,7 +1,7 @@
 import redis
-import json
 import time
 import importlib
+import threading
 from datetime import datetime, timezone
 from db.database import SessionLocal
 from db.models import Job
@@ -13,6 +13,18 @@ def get_handler(handler_path: str):
     module = importlib.import_module(module_path)
     return getattr(module, func_name)
 
+def send_heartbeat(job_id: str, stop_event: threading.Event):
+    while not stop_event.is_set():
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job:
+                job.last_heartbeat = datetime.now(timezone.utc)
+                db.commit()
+        finally:
+            db.close()
+        stop_event.wait(5)  # send heartbeat every 5 seconds
+
 def process_job(job_id: str):
     db = SessionLocal()
     try:
@@ -22,21 +34,36 @@ def process_job(job_id: str):
             return
 
         job.status = "RUNNING"
+        job.last_heartbeat = datetime.now(timezone.utc)
         job.updated_at = datetime.now(timezone.utc)
         db.commit()
         print(f"Running job: {job.name} ({job_id})")
 
-        handler = get_handler(job.handler)
-        result = handler(job.payload)
+        # start heartbeat in background thread
+        stop_event = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=send_heartbeat,
+            args=(job_id, stop_event),
+            daemon=True
+        )
+        heartbeat_thread.start()
 
-        job.status = "SUCCESS"
-        job.result = result
-        job.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        print(f"Job {job.name} completed successfully")
+        try:
+            handler = get_handler(job.handler)
+            result = handler(job.payload)
+
+            job = db.query(Job).filter(Job.id == job_id).first()
+            job.status = "SUCCESS"
+            job.result = result
+            job.updated_at = datetime.now(timezone.utc)
+            db.commit()
+            print(f"Job {job.name} completed successfully")
+
+        finally:
+            stop_event.set()  # stop heartbeat thread
 
     except Exception as e:
-        print(f"Error: {e}")   # this will show us the real error
+        print(f"Error: {e}")
         job = db.query(Job).filter(Job.id == job_id).first()
         if job:
             job.retry_count += 1
