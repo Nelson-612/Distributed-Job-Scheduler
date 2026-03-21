@@ -7,10 +7,13 @@ from croniter import croniter
 
 r = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
-HEARTBEAT_TIMEOUT = 15  # seconds before we assume worker crashed
+HEARTBEAT_TIMEOUT = 15
+
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 def enqueue_due_jobs(db):
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     due_jobs = db.query(Job).filter(
         Job.schedule != None,
         Job.status == "PENDING",
@@ -24,7 +27,7 @@ def enqueue_due_jobs(db):
         print(f"Enqueued cron job: {job.name}")
 
 def detect_crashed_workers(db):
-    timeout_threshold = datetime.now(timezone.utc) - timedelta(seconds=HEARTBEAT_TIMEOUT)
+    timeout_threshold = utcnow() - timedelta(seconds=HEARTBEAT_TIMEOUT)
     stuck_jobs = db.query(Job).filter(
         Job.status == "RUNNING",
         Job.last_heartbeat <= timeout_threshold
@@ -50,7 +53,7 @@ def reschedule_completed_jobs(db):
     ).all()
 
     for job in done_jobs:
-        cron = croniter(job.schedule, datetime.now(timezone.utc))
+        cron = croniter(job.schedule, utcnow())
         job.next_run_at = cron.get_next(datetime)
         job.status = "PENDING"
         job.result = None
