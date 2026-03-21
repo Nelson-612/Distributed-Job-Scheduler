@@ -22,3 +22,9 @@ def slow_job(payload: dict):
     print("Starting slow job, will take 60 seconds...")
     time.sleep(60)  # simulates a long running job
     return {"done": True}
+
+def timeout_test(payload: dict):
+    import time
+    print("Starting a job that will timeout...")
+    time.sleep(999)  # runs forever
+    return {"done": True}

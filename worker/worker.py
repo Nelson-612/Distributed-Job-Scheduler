@@ -2,11 +2,20 @@ import redis
 import time
 import importlib
 import threading
+import logging
 from datetime import datetime, timezone
 from db.database import SessionLocal
 from db.models import Job
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
 r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 def get_handler(handler_path: str):
     module_path, func_name = handler_path.rsplit(".", 1)
@@ -19,27 +28,25 @@ def send_heartbeat(job_id: str, stop_event: threading.Event):
         try:
             job = db.query(Job).filter(Job.id == job_id).first()
             if job:
-                job.last_heartbeat = datetime.now(timezone.utc)
+                job.last_heartbeat = utcnow()
                 db.commit()
         finally:
             db.close()
-        stop_event.wait(5)  # send heartbeat every 5 seconds
+        stop_event.wait(5)
 
 def process_job(job_id: str):
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.id == job_id).first()
         if not job:
-            print(f"Job {job_id} not found")
             return
 
         job.status = "RUNNING"
-        job.last_heartbeat = datetime.now(timezone.utc)
-        job.updated_at = datetime.now(timezone.utc)
+        job.last_heartbeat = utcnow()
+        job.updated_at = utcnow()
         db.commit()
-        print(f"Running job: {job.name} ({job_id})")
+        logger.info(f"Running job: {job.name} ({job_id})")
 
-        # start heartbeat in background thread
         stop_event = threading.Event()
         heartbeat_thread = threading.Thread(
             target=send_heartbeat,
@@ -48,39 +55,69 @@ def process_job(job_id: str):
         )
         heartbeat_thread.start()
 
-        try:
-            handler = get_handler(job.handler)
-            result = handler(job.payload)
+        result = [None]
+        error  = [None]
 
+        def run_handler():
+            try:
+                handler = get_handler(job.handler)
+                result[0] = handler(job.payload)
+            except Exception as e:
+                error[0] = e
+
+        handler_thread = threading.Thread(target=run_handler)
+        handler_thread.start()
+        handler_thread.join(timeout=job.timeout_sec)
+
+        stop_event.set()
+
+        if handler_thread.is_alive():
+            # job timed out
+            logger.warning(f"Job {job.name} timed out after {job.timeout_sec}s")
             job = db.query(Job).filter(Job.id == job_id).first()
-            job.status = "SUCCESS"
-            job.result = result
-            job.updated_at = datetime.now(timezone.utc)
+            job.retry_count += 1
+            if job.retry_count >= job.max_retries:
+                job.status = "FAILED"
+                job.result = {"error": "Job timed out, max retries exceeded"}
+                r.lpush("dead_letter_queue", job_id)
+                logger.error(f"Job {job.name} moved to dead letter queue")
+            else:
+                job.status = "PENDING"
+                r.zadd("job_queue", {job.id: job.priority})
+                logger.info(f"Job {job.name} requeued after timeout ({job.retry_count}/{job.max_retries})")
             db.commit()
-            print(f"Job {job.name} completed successfully")
+            return
 
-        finally:
-            stop_event.set()  # stop heartbeat thread
+        if error[0]:
+            raise error[0]
+
+        job = db.query(Job).filter(Job.id == job_id).first()
+        job.status = "SUCCESS"
+        job.result = result[0]
+        job.updated_at = utcnow()
+        db.commit()
+        logger.info(f"Job {job.name} completed successfully")
 
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Job {job_id} error: {e}")
         job = db.query(Job).filter(Job.id == job_id).first()
         if job:
             job.retry_count += 1
             if job.retry_count >= job.max_retries:
                 job.status = "FAILED"
                 job.result = {"error": str(e)}
-                print(f"Job {job.name} failed after {job.retry_count} retries")
+                r.lpush("dead_letter_queue", job_id)
+                logger.error(f"Job {job.name} moved to dead letter queue")
             else:
                 job.status = "PENDING"
                 r.zadd("job_queue", {job.id: job.priority})
-                print(f"Job {job.name} retrying ({job.retry_count}/{job.max_retries})")
+                logger.info(f"Job {job.name} retrying ({job.retry_count}/{job.max_retries})")
             db.commit()
     finally:
         db.close()
 
 def run_worker():
-    print("Worker started, waiting for jobs...")
+    logger.info("Worker started, waiting for jobs...")
     while True:
         result = r.zpopmin("job_queue", 1)
         if result:
